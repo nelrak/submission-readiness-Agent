@@ -127,9 +127,9 @@ st.markdown(
 # ── Main tabs: Dossier & Timeline ───────────────────────────────────────
 main_tab1, main_tab2 = st.tabs(["📄 Dossier Readiness", "📅 Submission Timeline"])
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # TAB 1: DOSSIER READINESS SCORECARD
-# ════════════════════���═════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 with main_tab1:
     tab_paste, tab_describe, tab_demo = st.tabs(
         ["📄 Paste dossier content", "✍️ Describe your submission", "🎯 Run demo"]
@@ -184,7 +184,7 @@ with main_tab1:
     elif run_demo:
         content_to_run = DEMO_DOSSIER
 
-    # ── Run agent ──────────────────────────────────────────────────────────
+    # ── Run agent ─────────────────────────────────────────────────────────
     if content_to_run:
         if not api_key:
             st.error("Please enter your Anthropic API key in the sidebar.")
@@ -266,7 +266,7 @@ Return the JSON scorecard."""
                 st.error(f"Error: {e}")
                 st.stop()
 
-        # ── Render results ───────────────────────────────────────────────────────
+        # ── Render results ──────────────────────────────────────────────────────
         st.markdown("---")
         st.markdown("## 📊 Dossier Scorecard Results")
 
@@ -390,33 +390,33 @@ Return the JSON scorecard."""
             "Tag it #RegulatoryAI #Veeva #eCTD"
         )
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # TAB 2: SUBMISSION TIMELINE & PLAN COMPLETION
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 with main_tab2:
-    st.markdown("### 📅 Upload and track submission plan timeline")
+    st.markdown("### 📅 Upload and track document submission progress")
     st.markdown(
-        "Upload an Excel file with submission plan milestones. "
-        "Specify **Planned Start**, **Planned Finish**, and **Status** for each task. "
-        "The system calculates completion % based on dates and status."
+        "Upload an Excel file with your module documents. "
+        "The system tracks completion % per module based on Document IDs submitted. "
+        "A missing Document ID counts as a 'miss' (incomplete submission)."
     )
 
     st.markdown("---")
     st.markdown("**Expected Excel format:**")
     st.markdown(
         """
-    | Task | Planned Start | Planned Finish | Status | Actual Start | Actual Finish |
-    |------|---------------|----------------|--------|--------------|---------------|
-    | Module 1 Administrative | 2026-04-01 | 2026-05-15 | In Progress | 2026-04-02 | |
-    | Module 3 CMC | 2026-04-15 | 2026-07-30 | Not Started | | |
-    | Module 5 Clinical | 2026-05-01 | 2026-08-15 | Not Started | | |
+    | Module Name | Module Title | Document ID | LCM (Lifecycle Mgmt) | File Name of Document | Planned Start Date | Planned Finish Date |
+    |-------------|--------------|-------------|---------------------|----------------------|-------------------|-------------------|
+    | Module 1 | Administrative | MOD1-001 | Draft | Cover_Letter.pdf | 2026-04-01 | 2026-05-15 |
+    | Module 1 | Administrative | MOD1-002 | Final | Form_FDA_356h.pdf | 2026-04-05 | 2026-05-15 |
+    | Module 3 | CMC | MOD3-001 | Draft | Drug_Substance.pdf | 2026-04-15 | 2026-07-30 |
     """
     )
 
     uploaded_file = st.file_uploader(
-        "📤 Upload Excel submission plan",
+        "📤 Upload Excel submission tracking",
         type=["xlsx", "xls"],
-        help="File must contain columns: Task, Planned Start, Planned Finish, Status"
+        help="File must contain: Module Name, Module Title, Document ID, Planned Start Date, Planned Finish Date"
     )
 
     if uploaded_file is not None:
@@ -424,55 +424,88 @@ with main_tab2:
             # Read Excel file
             df = pd.read_excel(uploaded_file)
 
-            # Validate required columns
-            required_cols = ["Task", "Planned Start", "Planned Finish", "Status"]
-            missing = [col for col in required_cols if col not in df.columns]
-            if missing:
-                st.error(f"Missing required columns: {', '.join(missing)}")
-                st.stop()
+            # Normalize column names (strip whitespace)
+            df.columns = df.columns.str.strip()
+
+            # Define required columns (flexible matching)
+            required_cols_map = {
+                "Module Name": ["Module Name", "Module"],
+                "Module Title": ["Module Title", "Title"],
+                "Document ID": ["Document ID", "DocID", "ID"],
+                "Planned Start Date": ["Planned Start Date", "Planned Start", "Start Date"],
+                "Planned Finish Date": ["Planned Finish Date", "Planned Finish", "Finish Date"]
+            }
+
+            # Map columns from Excel to standard names
+            actual_cols = {}
+            for standard_col, possible_names in required_cols_map.items():
+                found = False
+                for possible_name in possible_names:
+                    if possible_name in df.columns:
+                        actual_cols[standard_col] = possible_name
+                        found = True
+                        break
+                if not found:
+                    st.error(f"Missing required column: {standard_col}")
+                    st.stop()
+
+            # Rename columns to standard names
+            df = df.rename(columns={v: k for k, v in actual_cols.items()})
+
+            # Handle optional columns
+            if "LCM (Lifecycle Mgmt)" not in df.columns and "LCM" not in df.columns:
+                df["LCM (Lifecycle Mgmt)"] = "—"
+            
+            if "File Name of Document" not in df.columns and "File Name" not in df.columns:
+                df["File Name of Document"] = "—"
 
             # Convert date columns to datetime
-            df["Planned Start"] = pd.to_datetime(df["Planned Start"], errors="coerce")
-            df["Planned Finish"] = pd.to_datetime(df["Planned Finish"], errors="coerce")
-
-            if "Actual Start" in df.columns:
-                df["Actual Start"] = pd.to_datetime(df["Actual Start"], errors="coerce")
-            if "Actual Finish" in df.columns:
-                df["Actual Finish"] = pd.to_datetime(df["Actual Finish"], errors="coerce")
+            df["Planned Start Date"] = pd.to_datetime(df["Planned Start Date"], errors="coerce")
+            df["Planned Finish Date"] = pd.to_datetime(df["Planned Finish Date"], errors="coerce")
 
             # Calculate timeline metrics
             today = pd.Timestamp(datetime.now().date())
-            total_tasks = len(df)
 
-            # Calculate completion % for each task and overall
-            df["Days Planned"] = (df["Planned Finish"] - df["Planned Start"]).dt.days + 1
-            df["Days Elapsed"] = (today - df["Planned Start"]).dt.days
+            # Mark documents with missing Document IDs as "Miss"
+            df["Status"] = df["Document ID"].apply(
+                lambda x: "❌ MISS (No Doc ID)" if pd.isna(x) or (isinstance(x, str) and x.strip() == "") else "✅ Submitted"
+            )
+
+            # Calculate days elapsed for each document
+            df["Days Planned"] = (df["Planned Finish Date"] - df["Planned Start Date"]).dt.days + 1
+            df["Days Elapsed"] = (today - df["Planned Start Date"]).dt.days
             df["Plan Progress %"] = (df["Days Elapsed"] / df["Days Planned"] * 100).clip(0, 100)
 
-            # Status-based completion
-            status_completion = {
-                "Not Started": 0,
-                "In Progress": 50,
-                "Completed": 100,
-                "On Hold": 25,
-                "At Risk": 30
-            }
+            # Document completion (either submitted or missing)
+            df["Document Status %"] = df["Status"].apply(lambda x: 100 if "Submitted" in x else 0)
 
-            df["Status Completion %"] = df["Status"].map(status_completion).fillna(50)
+            # Combined completion: average of plan progress and document status
+            df["Completion %"] = (df["Plan Progress %"] + df["Document Status %"]) / 2
+            df["Completion %"] = df["Completion %"].round(1)
 
-            # Combined completion: average of plan progress and status completion
-            df["Overall Completion %"] = (df["Plan Progress %"] + df["Status Completion %"]) / 2
-            df["Overall Completion %"] = df["Overall Completion %"].round(1)
+            # Group by Module Name to calculate module-level completion
+            module_summary = df.groupby("Module Name").agg({
+                "Module Title": "first",
+                "Completion %": "mean",
+                "Document ID": "count",
+                "Status": lambda x: (x == "✅ Submitted").sum()
+            }).round(1)
+            module_summary.columns = ["Module Title", "Module Completion %", "Total Docs", "Submitted Docs"]
+            module_summary["Missing Docs"] = module_summary["Total Docs"] - module_summary["Submitted Docs"]
 
-            # Overall plan completion
-            overall_completion = df["Overall Completion %"].mean().round(1)
-            plan_completion_color = (
+            # Overall completion
+            overall_completion = df["Completion %"].mean().round(1)
+            total_docs = len(df)
+            submitted_docs = len(df[df["Status"] == "✅ Submitted"])
+            missed_docs = total_docs - submitted_docs
+
+            completion_color = (
                 "#d32f2f" if overall_completion < 30
                 else "#e07b00" if overall_completion < 70
                 else "#2e7d32"
             )
 
-            # Submission readiness label
+            # Readiness label
             if overall_completion < 30:
                 readiness_status = "🔴 Early Stage"
             elif overall_completion < 50:
@@ -484,29 +517,28 @@ with main_tab2:
 
             # Display overall metrics
             st.markdown("---")
-            st.markdown("## 📊 Submission Plan Status")
+            st.markdown("## 📊 Document Submission Status")
 
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.markdown(
                     f'<div class="metric-card">'
-                    f'<div class="metric-label">Plan Completion</div>'
-                    f'<div class="metric-value" style="color:{plan_completion_color}">{overall_completion}%</div>'
+                    f'<div class="metric-label">Overall Completion</div>'
+                    f'<div class="metric-value" style="color:{completion_color}">{overall_completion}%</div>'
                     f'</div>', unsafe_allow_html=True
                 )
             with col2:
                 st.markdown(
                     f'<div class="metric-card">'
-                    f'<div class="metric-label">Total Tasks</div>'
-                    f'<div class="metric-value">{total_tasks}</div>'
+                    f'<div class="metric-label">Documents Submitted</div>'
+                    f'<div class="metric-value" style="color:#2e7d32">{submitted_docs}/{total_docs}</div>'
                     f'</div>', unsafe_allow_html=True
                 )
             with col3:
-                completed = len(df[df["Status"] == "Completed"])
                 st.markdown(
                     f'<div class="metric-card">'
-                    f'<div class="metric-label">Tasks Completed</div>'
-                    f'<div class="metric-value" style="color:#2e7d32">{completed}</div>'
+                    f'<div class="metric-label">Missing Documents</div>'
+                    f'<div class="metric-value" style="color:#d32f2f">{missed_docs}</div>'
                     f'</div>', unsafe_allow_html=True
                 )
             with col4:
@@ -519,77 +551,81 @@ with main_tab2:
 
             st.markdown("<br>", unsafe_allow_html=True)
 
-            # Task-by-task breakdown
-            st.markdown("#### 📋 Task-by-task timeline")
+            # Module-level summary
+            st.markdown("#### 📋 Module-level completion")
             
-            display_df = df[[
-                "Task", "Planned Start", "Planned Finish", "Status",
-                "Plan Progress %", "Status Completion %", "Overall Completion %"
-            ]].copy()
-
-            display_df["Planned Start"] = display_df["Planned Start"].dt.strftime("%Y-%m-%d")
-            display_df["Planned Finish"] = display_df["Planned Finish"].dt.strftime("%Y-%m-%d")
-
-            for col in ["Plan Progress %", "Status Completion %", "Overall Completion %"]:
-                display_df[col] = display_df[col].round(1)
-
-            st.dataframe(display_df, use_container_width=True)
-
-            # Progress bars per task
-            st.markdown("---")
-            st.markdown("#### 📈 Progress by task")
-            for idx, row in df.iterrows():
-                col_a, col_b = st.columns([3, 1])
+            for module_name in module_summary.index:
+                completion_pct = module_summary.loc[module_name, "Module Completion %"]
+                submitted = int(module_summary.loc[module_name, "Submitted Docs"])
+                total = int(module_summary.loc[module_name, "Total Docs"])
+                missing = int(module_summary.loc[module_name, "Missing Docs"])
+                
+                col_a, col_b, col_c = st.columns([2, 1, 2])
                 with col_a:
                     st.progress(
-                        min(row["Overall Completion %"] / 100, 1.0),
-                        text=f"{row['Task']} ({row['Status']})"
+                        min(completion_pct / 100, 1.0),
+                        text=f"{module_name} ({submitted}/{total} docs)"
                     )
                 with col_b:
                     st.markdown(
-                        f'<p style="font-weight:600;margin-top:6px">{row["Overall Completion %"]:.1f}%</p>',
+                        f'<p style="font-weight:600;margin-top:6px">{completion_pct:.1f}%</p>',
                         unsafe_allow_html=True
                     )
+                with col_c:
+                    if missing > 0:
+                        st.markdown(
+                            f'<p style="color:#d32f2f;font-weight:600;margin-top:6px">⚠️ {missing} miss</p>',
+                            unsafe_allow_html=True
+                        )
 
             st.markdown("---")
 
-            # At-risk tasks
-            at_risk = df[df["Status"].isin(["At Risk", "On Hold"])]
-            if len(at_risk) > 0:
-                st.markdown("#### ⚠️ At-risk or on-hold tasks")
-                for idx, row in at_risk.iterrows():
+            # Document-level detail
+            st.markdown("#### 📄 Document-level detail")
+            
+            display_df = df[[
+                "Module Name", "Module Title", "Document ID", 
+                "File Name of Document", "Planned Start Date", "Planned Finish Date",
+                "Status", "Completion %"
+            ]].copy()
+
+            display_df["Planned Start Date"] = display_df["Planned Start Date"].dt.strftime("%Y-%m-%d")
+            display_df["Planned Finish Date"] = display_df["Planned Finish Date"].dt.strftime("%Y-%m-%d")
+            display_df["Completion %"] = display_df["Completion %"].round(1)
+
+            st.dataframe(display_df, use_container_width=True)
+
+            st.markdown("---")
+
+            # Missing documents summary
+            missing_docs_df = df[df["Status"] == "❌ MISS (No Doc ID)"]
+            if len(missing_docs_df) > 0:
+                st.markdown("#### ❌ Missing Document IDs (Submission Gaps)")
+                for idx, row in missing_docs_df.iterrows():
                     st.warning(
-                        f"**{row['Task']}** — Status: {row['Status']} | "
-                        f"Due: {row['Planned Finish'].strftime('%Y-%m-%d')}"
+                        f"**{row['Module Name']} - {row['Module Title']}** | "
+                        f"Due: {row['Planned Finish Date'].strftime('%Y-%m-%d')} | "
+                        f"No Document ID assigned"
                     )
 
-            # Timeline visualization
-            st.markdown("#### 📅 Timeline view")
-            st.markdown(
-                f"**Plan coverage:** {df['Planned Start'].min().strftime('%Y-%m-%d')} → "
-                f"{df['Planned Finish'].max().strftime('%Y-%m-%d')} "
-                f"({(df['Planned Finish'].max() - df['Planned Start'].min()).days} days)"
-            )
-
-            # Download summary
             st.markdown("---")
+
+            # Export summary
             st.markdown("#### 📥 Export results")
 
             summary_data = {
                 "Metric": [
-                    "Overall Plan Completion %",
-                    "Total Tasks",
-                    "Tasks Completed",
-                    "Tasks In Progress",
-                    "Tasks Not Started",
+                    "Overall Completion %",
+                    "Total Documents",
+                    "Documents Submitted",
+                    "Missing Document IDs",
                     "Readiness Status"
                 ],
                 "Value": [
                     f"{overall_completion}%",
-                    str(total_tasks),
-                    str(len(df[df["Status"] == "Completed"])),
-                    str(len(df[df["Status"] == "In Progress"])),
-                    str(len(df[df["Status"] == "Not Started"])),
+                    str(total_docs),
+                    str(submitted_docs),
+                    str(missed_docs),
                     readiness_status
                 ]
             }
@@ -599,11 +635,11 @@ with main_tab2:
             st.download_button(
                 label="📥 Download summary as CSV",
                 data=csv_buffer,
-                file_name="submission_plan_summary.csv",
+                file_name="submission_document_summary.csv",
                 mime="text/csv"
             )
 
-            st.success("✅ Submission plan analysed successfully!")
+            st.success("✅ Document submission tracking complete!")
 
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
