@@ -92,6 +92,26 @@ Pivotal Phase 3 CSR complete. Phase 1/2 data complete.
 No paediatric clinical data.
 """
 
+# Helper function to normalize and fuzzy match column names
+def find_column(df, keywords):
+    """Find column by fuzzy matching keywords. Keywords is a list of possible names."""
+    normalized_cols = {col: col.strip().replace('\n', ' ').replace('\r', ' ') for col in df.columns}
+    normalized_cols = {' '.join(k.split()): v for k, v in normalized_cols.items()}
+    
+    for keyword in keywords:
+        keyword_normalized = ' '.join(keyword.strip().replace('\n', ' ').replace('\r', ' ').split())
+        if keyword_normalized in normalized_cols:
+            return normalized_cols[keyword_normalized]
+    
+    # Fuzzy partial match
+    for keyword in keywords:
+        keyword_lower = keyword.lower()
+        for normalized_col, original_col in normalized_cols.items():
+            if keyword_lower in normalized_col.lower():
+                return original_col
+    
+    return None
+
 # ── Sidebar ───────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
@@ -402,7 +422,7 @@ with main_tab2:
     )
 
     st.markdown("---")
-    st.markdown("**Expected Excel format:**")
+    st.markdown("**Expected Excel format (headers can be in any column order):**")
     st.markdown(
         """
     | Module Name | Module Title | Document ID | LCM (Lifecycle Mgmt) | File Name of Document | Planned Start Date | Planned Finish Date |
@@ -424,43 +444,56 @@ with main_tab2:
             # Read Excel file
             df = pd.read_excel(uploaded_file)
 
-            # Normalize column names: strip, replace newlines, and collapse whitespace
-            df.columns = [col.strip().replace('\n', ' ').replace('\r', ' ') for col in df.columns]
-            df.columns = [' '.join(col.split()) for col in df.columns]  # Collapse multiple spaces
-            
-            # Debug: show actual column names
-            st.info(f"**Detected columns:** {', '.join(df.columns)}")
+            # Show detected columns
+            st.info(f"**✅ Detected columns:** {', '.join(df.columns)}")
 
-            # Define required columns (flexible matching)
-            required_cols_map = {
-                "Module Name": ["Module Name", "Module"],
-                "Module Title": ["Module Title", "Title"],
-                "Document ID": ["Document ID", "DocID", "ID"],
-                "Planned Start Date": ["Planned Start Date", "Planned Start", "Start Date"],
-                "Planned Finish Date": ["Planned Finish Date", "Planned Finish", "Finish Date"]
-            }
+            # Use fuzzy matching to find required columns
+            module_name_col = find_column(df, ["Module Name", "Module"])
+            module_title_col = find_column(df, ["Module Title", "Title"])
+            doc_id_col = find_column(df, ["Document ID", "DocID", "ID"])
+            start_date_col = find_column(df, ["Planned Start Date", "Planned Start", "Start Date"])
+            finish_date_col = find_column(df, ["Planned Finish Date", "Planned Finish", "Finish Date"])
 
-            # Map columns from Excel to standard names
-            actual_cols = {}
-            for standard_col, possible_names in required_cols_map.items():
-                found = False
-                for possible_name in possible_names:
-                    if possible_name in df.columns:
-                        actual_cols[standard_col] = possible_name
-                        found = True
-                        break
-                if not found:
-                    st.error(f"Missing required column: {standard_col}\n\nExpected one of: {', '.join(possible_names)}\n\nYour columns: {', '.join(df.columns)}")
-                    st.stop()
+            # Check if all required columns were found
+            missing = []
+            if not module_name_col:
+                missing.append("Module Name")
+            if not module_title_col:
+                missing.append("Module Title")
+            if not doc_id_col:
+                missing.append("Document ID")
+            if not start_date_col:
+                missing.append("Planned Start Date")
+            if not finish_date_col:
+                missing.append("Planned Finish Date")
 
-            # Rename columns to standard names
-            df = df.rename(columns={v: k for k, v in actual_cols.items()})
+            if missing:
+                st.error(f"❌ Missing required columns: {', '.join(missing)}\n\nYour columns: {', '.join(df.columns)}")
+                st.stop()
+
+            # Rename columns to standard names for processing
+            df = df.rename(columns={
+                module_name_col: "Module Name",
+                module_title_col: "Module Title",
+                doc_id_col: "Document ID",
+                start_date_col: "Planned Start Date",
+                finish_date_col: "Planned Finish Date"
+            })
+
+            st.success(f"✅ Matched columns: Module Name, Module Title, Document ID, Planned Start Date, Planned Finish Date")
 
             # Handle optional columns
-            if "LCM (Lifecycle Mgmt)" not in df.columns and "LCM" not in df.columns:
+            lcm_col = find_column(df, ["LCM", "Lifecycle"])
+            file_col = find_column(df, ["File Name", "Document Name"])
+
+            if lcm_col and lcm_col not in ["LCM (Lifecycle Mgmt)"]:
+                df = df.rename(columns={lcm_col: "LCM (Lifecycle Mgmt)"})
+            elif "LCM (Lifecycle Mgmt)" not in df.columns:
                 df["LCM (Lifecycle Mgmt)"] = "—"
-            
-            if "File Name of Document" not in df.columns and "File Name" not in df.columns:
+
+            if file_col and file_col not in ["File Name of Document"]:
+                df = df.rename(columns={file_col: "File Name of Document"})
+            elif "File Name of Document" not in df.columns:
                 df["File Name of Document"] = "—"
 
             # Convert date columns to datetime
