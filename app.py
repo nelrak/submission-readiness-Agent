@@ -424,8 +424,12 @@ with main_tab2:
             # Read Excel file
             df = pd.read_excel(uploaded_file)
 
-            # Normalize column names (strip whitespace)
-            df.columns = df.columns.str.strip()
+            # Normalize column names: strip, replace newlines, and collapse whitespace
+            df.columns = [col.strip().replace('\n', ' ').replace('\r', ' ') for col in df.columns]
+            df.columns = [' '.join(col.split()) for col in df.columns]  # Collapse multiple spaces
+            
+            # Debug: show actual column names
+            st.info(f"**Detected columns:** {', '.join(df.columns)}")
 
             # Define required columns (flexible matching)
             required_cols_map = {
@@ -446,7 +450,7 @@ with main_tab2:
                         found = True
                         break
                 if not found:
-                    st.error(f"Missing required column: {standard_col}")
+                    st.error(f"Missing required column: {standard_col}\n\nExpected one of: {', '.join(possible_names)}\n\nYour columns: {', '.join(df.columns)}")
                     st.stop()
 
             # Rename columns to standard names
