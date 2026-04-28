@@ -1,516 +1,382 @@
-"""
-Submission Readiness Scorecard Agent
-=====================================
-Accepts: PDF, DOCX, TXT, or plain text input
-Checks against: ICH M4, ICH Q1A, FDA 21 CFR, EMA guidelines
-Outputs: Pass/Fail checks + % score per module + prioritised fix list
-
-Requirements:
-    pip install anthropic python-docx pymupdf rich
-"""
-
-import os
-import json
-import argparse
-import sys
-from pathlib import Path
-
-# ── Optional rich for pretty terminal output ──────────────────────────────────
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich import print as rprint
-    RICH = True
-    console = Console()
-except ImportError:
-    RICH = False
-    console = None
-
+import streamlit as st
 import anthropic
+import json
+import re
 
+# ── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Submission Readiness Scorecard Agent",
+    page_icon="📋",
+    layout="wide",
+)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1.  FILE READERS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 1.8rem;
+        font-weight: 600;
+        color: #1a1a2e;
+        margin-bottom: 0.2rem;
+    }
+    .sub-header {
+        font-size: 0.95rem;
+        color: #666;
+        margin-bottom: 1.5rem;
+    }
+    .score-big {
+        font-size: 3rem;
+        font-weight: 700;
+        text-align: center;
+    }
+    .metric-card {
+        background: #f8f9fa;
+        border-radius: 10px;
+        padding: 1rem;
+        text-align: center;
+        border: 1px solid #e0e0e0;
+    }
+    .metric-label {
+        font-size: 0.78rem;
+        color: #888;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .metric-value {
+        font-size: 1.8rem;
+        font-weight: 600;
+        color: #1a1a2e;
+    }
+    .check-pass  { color: #1a9e5f; font-weight: 500; }
+    .check-warn  { color: #e07b00; font-weight: 500; }
+    .check-fail  { color: #d32f2f; font-weight: 500; }
+    .badge-p1 { background:#fdecea; color:#c62828; padding:2px 8px; border-radius:12px; font-size:0.75rem; font-weight:600; }
+    .badge-p2 { background:#fff3e0; color:#e65100; padding:2px 8px; border-radius:12px; font-size:0.75rem; font-weight:600; }
+    .badge-p3 { background:#e8f5e9; color:#2e7d32; padding:2px 8px; border-radius:12px; font-size:0.75rem; font-weight:600; }
+    .section-divider { border-top: 1px solid #e0e0e0; margin: 1.2rem 0; }
+    .stProgress > div > div > div > div { border-radius: 4px; }
+    footer { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
 
-def read_txt(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="ignore")
+# ── Demo dossier text ─────────────────────────────────────────────────────────
+DEMO_DOSSIER = """
+NDA submission for a small molecule oral tablet (twice daily dosing).
 
+Module 1 – Administrative:
+Cover letter present. Form FDA 356h completed. No paediatric investigation plan (PIP) submitted.
+Risk Management Plan (RMP) not included.
 
-def read_pdf(path: Path) -> str:
-    try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(str(path))
-        pages = []
-        for page in doc:
-            pages.append(page.get_text())
-        doc.close()
-        return "\n".join(pages)
-    except ImportError:
-        print("pymupdf not installed. Run: pip install pymupdf")
-        sys.exit(1)
+Module 2 – Summaries:
+Quality Overall Summary (QOS) drafted but not finalised. Non-clinical overview complete.
+Clinical overview complete. No integrated summary of safety (ISS) or efficacy (ISE).
 
+Module 3 – CMC:
+Drug Substance: synthesis route described, specifications set, 3 batches of analytical data present.
+Stability data available for 12 months only (ICH Q1A requires 24 months for NDA).
+Container closure system described. No genotoxic impurity assessment (ICH M7).
 
-def read_docx(path: Path) -> str:
-    try:
-        from docx import Document
-        doc = Document(str(path))
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        return "\n".join(paragraphs)
-    except ImportError:
-        print("python-docx not installed. Run: pip install python-docx")
-        sys.exit(1)
+Drug Product: composition and formulation described, manufacturing process validated,
+finished product specifications set, dissolution data complete.
+No comparability protocol for post-approval changes. No elemental impurities assessment (ICH Q3D).
 
+Module 4 – Non-clinical:
+All pharmacology, PK, and toxicology studies complete and summarised.
+No juvenile animal study data included.
 
-def load_submission_file(file_path: str) -> str:
-    """
-    Load a submission plan / dossier from a file.
-    Supported formats: .pdf  .docx  .doc  .txt  .md
-    """
-    path = Path(file_path)
-    if not path.exists():
-        print(f"[ERROR] File not found: {file_path}")
-        sys.exit(1)
+Module 5 – Clinical:
+Pivotal Phase 3 CSR complete. Phase 1/2 data complete.
+120-day safety update outstanding. No dedicated hepatic impairment PK study.
+No paediatric clinical data.
+"""
 
-    suffix = path.suffix.lower()
-    print(f"  Loading {path.name} ({suffix}) …")
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Configuration")
+    api_key = st.text_input("Anthropic API Key", type="password",
+                            help="Get your key at console.anthropic.com")
+    st.markdown("---")
+    region = st.selectbox("Target Region",
+                          ["FDA + EMA (both)", "FDA only", "EMA only"])
+    product_type = st.selectbox("Product Type",
+                                ["Small molecule", "Biologic / biosimilar",
+                                 "ATMP / gene therapy", "Fixed-dose combination"])
+    st.markdown("---")
+    st.markdown("**About this agent**")
+    st.caption(
+        "Built by a regulatory AI specialist. "
+        "Checks NDA/MAA dossiers against ICH M4, Q1A, Q3D, M7, "
+        "FDA 21 CFR, and EMA guidelines. "
+        "Returns pass/fail checks, a readiness score, "
+        "and a prioritised fix list."
+    )
+    st.markdown("---")
+    st.caption("🔗 Follow on LinkedIn for weekly regulatory AI tools")
 
-    if suffix == ".pdf":
-        content = read_pdf(path)
-    elif suffix in (".docx", ".doc"):
-        content = read_docx(path)
-    elif suffix in (".txt", ".md"):
-        content = read_txt(path)
-    else:
-        print(f"[ERROR] Unsupported file type '{suffix}'. Use PDF, DOCX, TXT or MD.")
-        sys.exit(1)
+# ── Main layout ───────────────────────────────────────────────────────────────
+st.markdown('<p class="main-header">📋 Submission Readiness Scorecard Agent</p>',
+            unsafe_allow_html=True)
+st.markdown(
+    '<p class="sub-header">NDA / MAA · Full CTD dossier · '
+    'ICH M4 · FDA · EMA · Instant pass/fail + prioritised fix list</p>',
+    unsafe_allow_html=True,
+)
 
-    word_count = len(content.split())
-    print(f"  Extracted {word_count:,} words from {path.name}")
+tab_paste, tab_describe, tab_demo = st.tabs(
+    ["📄 Paste dossier content", "✍️ Describe your submission", "🎯 Run demo"]
+)
 
-    # Truncate very large documents to ~6000 words to stay within token budget
-    words = content.split()
-    if len(words) > 6000:
-        content = " ".join(words[:6000])
-        print(f"  Truncated to first 6,000 words for API call.")
+with tab_paste:
+    user_content = st.text_area(
+        "Paste any part of your dossier — TOC, summaries, status notes",
+        height=220,
+        placeholder=(
+            "Module 1: Cover letter present, Form FDA 356h complete...\n"
+            "Module 3: Drug substance synthesis described, stability 24 months...\n"
+            "Module 5: Pivotal Phase 3 CSR included..."
+        ),
+    )
+    run_paste = st.button("▶ Run Scorecard", key="run_paste", type="primary",
+                          use_container_width=True)
 
-    return content
+with tab_describe:
+    user_describe = st.text_area(
+        "Describe your submission status in plain language",
+        height=220,
+        placeholder=(
+            "e.g. Small molecule NDA for FDA. Module 3 mostly complete "
+            "but stability only 12 months. Module 2 QOS drafted. "
+            "Clinical modules complete. No paediatric plan yet."
+        ),
+    )
+    run_describe = st.button("▶ Run Scorecard", key="run_describe", type="primary",
+                             use_container_width=True)
 
+with tab_demo:
+    st.info(
+        "Pre-filled NDA example with common gaps: missing paediatric plan, "
+        "12-month stability only, no RMP, no elemental impurities assessment."
+    )
+    with st.expander("View demo dossier content"):
+        st.text(DEMO_DOSSIER)
+    run_demo = st.button("▶ Run Demo Scorecard", key="run_demo", type="primary",
+                         use_container_width=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2.  PROMPT BUILDER
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Determine what to run ─────────────────────────────────────────────────────
+content_to_run = None
+if run_paste and user_content.strip():
+    content_to_run = user_content.strip()
+elif run_paste and not user_content.strip():
+    st.warning("Please paste some dossier content first.")
+elif run_describe and user_describe.strip():
+    content_to_run = user_describe.strip()
+elif run_describe and not user_describe.strip():
+    st.warning("Please describe your submission first.")
+elif run_demo:
+    content_to_run = DEMO_DOSSIER
 
-SYSTEM_PROMPT = """You are a senior regulatory affairs expert (20+ years) with deep expertise in 
-NDA/MAA submissions, ICH guidelines, FDA 21 CFR, and EMA requirements. 
-You evaluate submission dossiers for readiness and provide precise, actionable feedback 
-referencing real guidelines."""
+# ── Run agent ─────────────────────────────────────────────────────────────────
+if content_to_run:
+    if not api_key:
+        st.error("Please enter your Anthropic API key in the sidebar.")
+        st.stop()
 
-def build_prompt(content: str, region: str, product_type: str) -> str:
-    region_label = {
-        "fda":  "FDA (US NDA)",
-        "ema":  "EMA (EU MAA)",
-        "both": "FDA (US NDA) and EMA (EU MAA)"
-    }.get(region, "FDA and EMA")
+    SYSTEM_PROMPT = """You are a senior regulatory affairs expert with 20+ years of experience 
+reviewing NDA and MAA submissions for FDA and EMA. You check dossiers against:
+- ICH M4 (CTD structure and completeness)
+- ICH Q1A (stability requirements)
+- ICH Q3D (elemental impurities)
+- ICH M7 (genotoxic impurities)
+- ICH E11 (paediatric studies)
+- FDA 21 CFR Part 314 (NDA requirements)
+- EMA Module 1 requirements and RMP guidelines
 
-    product_label = {
-        "small_molecule": "Small molecule drug product",
-        "biologic":       "Biologic / biosimilar",
-        "atmp":           "Advanced therapy medicinal product (ATMP / gene therapy)"
-    }.get(product_type, "Small molecule drug product")
-
-    return f"""You are reviewing a submission plan / dossier extract for regulatory readiness.
-
-Target region: {region_label}
-Product type:  {product_label}
-
-Dossier content:
----
-{content}
----
-
-Evaluate this submission against:
-- ICH M4 CTD structure (Modules 1–5)
-- ICH Q1A(R2) stability requirements
-- ICH Q8/Q9/Q10/Q11 CMC guidelines  
-- Regional requirements: {region_label}
-- Paediatric requirements (PIP / iPSP)
-- Risk management requirements (RMP / REMS where applicable)
-
-Respond ONLY with a valid JSON object — no markdown fences, no preamble, no trailing text.
-
-JSON schema (fill every field):
-{{
-  "score": <integer 0–100>,
-  "passed": <integer — number of passed checks>,
+You MUST respond ONLY with a valid JSON object. No markdown, no backticks, no preamble.
+The JSON must follow this exact schema:
+{
+  "score": <integer 0-100>,
+  "passed_count": <integer>,
   "critical_count": <integer>,
   "warning_count": <integer>,
-  "readiness_label": "<Not ready | Needs work | Nearly ready | Ready to file>",
+  "readiness_label": "<Not ready | Needs significant work | Needs work | Nearly ready | Ready to file>",
+  "readiness_color": "<red | orange | amber | green>",
   "modules": [
-    {{"name": "Module 1 – Administrative",   "score": <0–100>, "status": "<green|amber|red>"}},
-    {{"name": "Module 2 – Summaries",        "score": <0–100>, "status": "<green|amber|red>"}},
-    {{"name": "Module 3 – CMC",              "score": <0–100>, "status": "<green|amber|red>"}},
-    {{"name": "Module 4 – Non-clinical",     "score": <0–100>, "status": "<green|amber|red>"}},
-    {{"name": "Module 5 – Clinical",         "score": <0–100>, "status": "<green|amber|red>"}}
+    {"name": "Module 1 – Administrative", "score": <0-100>, "status": "<green|amber|red>"},
+    {"name": "Module 2 – Summaries",      "score": <0-100>, "status": "<green|amber|red>"},
+    {"name": "Module 3 – CMC",            "score": <0-100>, "status": "<green|amber|red>"},
+    {"name": "Module 4 – Non-clinical",   "score": <0-100>, "status": "<green|amber|red>"},
+    {"name": "Module 5 – Clinical",       "score": <0-100>, "status": "<green|amber|red>"}
   ],
   "critical": [
-    {{
-      "title": "<short issue title>",
-      "comment": "<specific regulatory comment referencing ICH/FDA/EMA guideline>",
-      "guideline": "<e.g. ICH Q1A(R2), FDA 21 CFR 314.50>"
-    }}
+    {"title": "<issue>", "guideline": "<e.g. ICH Q1A(R2)>", "comment": "<specific regulatory comment>"}
   ],
   "warnings": [
-    {{
-      "title": "<short issue title>",
-      "comment": "<specific comment>",
-      "guideline": "<guideline reference>"
-    }}
+    {"title": "<issue>", "guideline": "<guideline ref>", "comment": "<comment>"}
   ],
-  "passed_checks": [
-    {{
-      "title": "<what passed>",
-      "comment": "<brief confirmation note>"
-    }}
+  "passed": [
+    {"title": "<what passed>", "comment": "<brief note>"}
   ],
   "fix_list": [
-    {{
-      "priority": "<P1|P2|P3>",
-      "action": "<specific action — what to do, not just what is missing>",
-      "effort": "<Low|Medium|High>",
-      "owner": "<e.g. CMC team | Clinical team | Regulatory affairs>"
-    }}
-  ],
-  "summary": "<2–3 sentence overall assessment of the dossier>"
-}}
+    {"priority": "P1", "action": "<specific action>", "guideline": "<ref>"},
+    {"priority": "P2", "action": "<specific action>", "guideline": "<ref>"},
+    {"priority": "P3", "action": "<specific action>", "guideline": "<ref>"}
+  ]
+}
+Include 3-7 critical issues, 2-5 warnings, 3-8 passed checks, 5-10 fix list items.
+Be specific. Reference real guidelines. P1 = submission blocker, P2 = strongly recommended, P3 = best practice."""
 
-Rules:
-- P1 = filing blocker (critical gap), P2 = strongly recommended, P3 = nice-to-have
-- Return 3–8 critical issues, 2–6 warnings, 3–10 passed checks, 4–10 fix list items
-- Be specific — reference actual guideline sections and CTD locations
-- If content is sparse, still evaluate based on what is NOT mentioned
-"""
+    user_prompt = f"""Please evaluate this NDA/MAA submission for readiness.
+Target region: {region}
+Product type: {product_type}
 
+Dossier content:
+{content_to_run}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 3.  API CALL
-# ══════════════════════════════════════════════════════════════════════════════
+Return the JSON scorecard."""
 
-def run_scorecard(content: str, region: str, product_type: str) -> dict:
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    with st.spinner("Analysing dossier against ICH guidelines and regional requirements..."):
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=2000,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw = response.content[0].text.strip()
+            raw = re.sub(r"```json|```", "", raw).strip()
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            st.error("Could not parse agent response. Try again.")
+            st.code(raw, language="text")
+            st.stop()
+        except anthropic.AuthenticationError:
+            st.error("Invalid API key. Check your key in the sidebar.")
+            st.stop()
+        except Exception as e:
+            st.error(f"Error: {e}")
+            st.stop()
 
-    print("  Calling Anthropic API …")
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        messages=[
-            {"role": "user", "content": build_prompt(content, region, product_type)}
-        ]
+    # ── Render results ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("## 📊 Scorecard Results")
+
+    # Score colour
+    score = result.get("score", 0)
+    score_color = (
+        "#d32f2f" if score < 50
+        else "#e07b00" if score < 70
+        else "#2e7d32"
     )
 
-    raw = response.content[0].text.strip()
-    # Strip accidental markdown fences
-    raw = raw.replace("```json", "").replace("```", "").strip()
-
-    result = json.loads(raw)
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4.  OUTPUT RENDERER
-# ══════════════════════════════════════════════════════════════════════════════
-
-STATUS_ICON = {"green": "✓", "amber": "⚠", "red": "✗"}
-PRIORITY_LABEL = {"P1": "CRITICAL", "P2": "WARNING ", "P3": "INFO    "}
-
-
-def render_plain(result: dict, output_file: str | None = None):
-    lines = []
-    lines.append("=" * 70)
-    lines.append("  SUBMISSION READINESS SCORECARD")
-    lines.append("=" * 70)
-    lines.append(f"  Overall score   : {result['score']}%")
-    lines.append(f"  Readiness       : {result['readiness_label']}")
-    lines.append(f"  Checks passed   : {result['passed']}")
-    lines.append(f"  Critical gaps   : {result['critical_count']}")
-    lines.append(f"  Warnings        : {result['warning_count']}")
-    lines.append("")
-    lines.append(f"  Summary: {result.get('summary', '')}")
-    lines.append("")
-
-    lines.append("── MODULE SCORES " + "─" * 54)
-    for m in result["modules"]:
-        icon = STATUS_ICON.get(m["status"], "?")
-        bar_filled = int(m["score"] / 5)
-        bar = "█" * bar_filled + "░" * (20 - bar_filled)
-        lines.append(f"  {icon}  {m['name']:<35} {bar}  {m['score']}%")
-
-    lines.append("")
-    lines.append("── CRITICAL GAPS (filing blockers) " + "─" * 35)
-    for i, c in enumerate(result["critical"], 1):
-        lines.append(f"  {i}. {c['title']}")
-        lines.append(f"     {c['comment']}")
-        lines.append(f"     Guideline: {c.get('guideline', 'N/A')}")
-        lines.append("")
-
-    lines.append("── WARNINGS " + "─" * 58)
-    for i, w in enumerate(result["warnings"], 1):
-        lines.append(f"  {i}. {w['title']}")
-        lines.append(f"     {w['comment']}")
-        lines.append(f"     Guideline: {w.get('guideline', 'N/A')}")
-        lines.append("")
-
-    lines.append("── PASSED CHECKS " + "─" * 53)
-    for p in result["passed_checks"]:
-        lines.append(f"  ✓  {p['title']}")
-        lines.append(f"     {p['comment']}")
-    lines.append("")
-
-    lines.append("── PRIORITISED FIX LIST " + "─" * 46)
-    for i, f in enumerate(result["fix_list"], 1):
-        label = PRIORITY_LABEL.get(f["priority"], f["priority"])
-        effort = f.get("effort", "")
-        owner  = f.get("owner", "")
-        lines.append(f"  {i:>2}. [{label}] {f['action']}")
-        lines.append(f"      Effort: {effort}   Owner: {owner}")
-        lines.append("")
-
-    lines.append("=" * 70)
-    output = "\n".join(lines)
-    print(output)
-
-    if output_file:
-        Path(output_file).write_text(output, encoding="utf-8")
-        print(f"\n  Report saved to: {output_file}")
-
-
-def render_rich(result: dict, output_file: str | None = None):
-    score = result["score"]
-    score_color = "green" if score >= 80 else "yellow" if score >= 60 else "red"
-
-    console.print()
-    console.print(Panel.fit(
-        f"[bold]Overall score:[/bold] [{score_color}]{score}%[/{score_color}]   "
-        f"[bold]Readiness:[/bold] {result['readiness_label']}   "
-        f"[bold]Passed:[/bold] {result['passed']}   "
-        f"[bold]Critical:[/bold] [red]{result['critical_count']}[/red]   "
-        f"[bold]Warnings:[/bold] [yellow]{result['warning_count']}[/yellow]",
-        title="[bold]Submission Readiness Scorecard[/bold]",
-        border_style="blue"
-    ))
-
-    if result.get("summary"):
-        console.print(f"\n[dim]{result['summary']}[/dim]\n")
-
-    # Module scores table
-    mod_table = Table(title="Module Scores", show_header=True, header_style="bold")
-    mod_table.add_column("Module", style="white", width=38)
-    mod_table.add_column("Score", justify="right", width=8)
-    mod_table.add_column("Bar", width=22)
-    mod_table.add_column("Status", width=8)
-    for m in result["modules"]:
-        s = m["score"]
-        col = "green" if m["status"] == "green" else "yellow" if m["status"] == "amber" else "red"
-        bar = f"[{col}]{'█' * int(s/5)}[/{col}]" + "░" * (20 - int(s/5))
-        icon = {"green": "✓", "amber": "⚠", "red": "✗"}.get(m["status"], "?")
-        mod_table.add_row(m["name"], f"[{col}]{s}%[/{col}]", bar, f"[{col}]{icon}[/{col}]")
-    console.print(mod_table)
-
-    # Critical gaps
-    if result["critical"]:
-        console.print("\n[bold red]Critical Gaps — filing blockers[/bold red]")
-        for i, c in enumerate(result["critical"], 1):
-            console.print(f"  [red]{i}.[/red] [bold]{c['title']}[/bold]")
-            console.print(f"     {c['comment']}")
-            console.print(f"     [dim]Guideline: {c.get('guideline', 'N/A')}[/dim]")
-
-    # Warnings
-    if result["warnings"]:
-        console.print("\n[bold yellow]Warnings[/bold yellow]")
-        for i, w in enumerate(result["warnings"], 1):
-            console.print(f"  [yellow]{i}.[/yellow] [bold]{w['title']}[/bold]")
-            console.print(f"     {w['comment']}")
-            console.print(f"     [dim]Guideline: {w.get('guideline', 'N/A')}[/dim]")
-
-    # Passed
-    if result["passed_checks"]:
-        console.print("\n[bold green]Passed Checks[/bold green]")
-        for p in result["passed_checks"]:
-            console.print(f"  [green]✓[/green] {p['title']} — [dim]{p['comment']}[/dim]")
-
-    # Fix list
-    console.print("\n[bold]Prioritised Fix List[/bold]")
-    fix_table = Table(show_header=True, header_style="bold", show_lines=True)
-    fix_table.add_column("#",        width=4)
-    fix_table.add_column("Priority", width=10)
-    fix_table.add_column("Action",   width=44)
-    fix_table.add_column("Effort",   width=8)
-    fix_table.add_column("Owner",    width=20)
-    for i, f in enumerate(result["fix_list"], 1):
-        p = f["priority"]
-        col = "red" if p == "P1" else "yellow" if p == "P2" else "green"
-        fix_table.add_row(
-            str(i),
-            f"[{col}]{p}[/{col}]",
-            f["action"],
-            f.get("effort", ""),
-            f.get("owner", "")
+    # Top metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Overall score</div>'
+            f'<div class="metric-value" style="color:{score_color}">{score}%</div>'
+            f'</div>', unsafe_allow_html=True
         )
-    console.print(fix_table)
+    with col2:
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Checks passed</div>'
+            f'<div class="metric-value" style="color:#2e7d32">{result.get("passed_count","—")}</div>'
+            f'</div>', unsafe_allow_html=True
+        )
+    with col3:
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Critical gaps</div>'
+            f'<div class="metric-value" style="color:#d32f2f">{result.get("critical_count","—")}</div>'
+            f'</div>', unsafe_allow_html=True
+        )
+    with col4:
+        label = result.get("readiness_label", "—")
+        label_color = (
+            "#d32f2f" if "Not ready" in label
+            else "#e07b00" if "work" in label.lower()
+            else "#2e7d32"
+        )
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-label">Readiness</div>'
+            f'<div class="metric-value" style="color:{label_color};font-size:1.1rem">{label}</div>'
+            f'</div>', unsafe_allow_html=True
+        )
 
-    if output_file:
-        render_plain(result, output_file)
+    st.markdown("<br>", unsafe_allow_html=True)
 
+    # Module scores
+    st.markdown("#### Module-by-module scores")
+    status_colors = {"green": "#2e7d32", "amber": "#e07b00", "red": "#d32f2f"}
+    for mod in result.get("modules", []):
+        ms = mod.get("score", 0)
+        mstatus = mod.get("status", "amber")
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.progress(ms / 100, text=mod["name"])
+        with col_b:
+            st.markdown(
+                f'<p style="color:{status_colors.get(mstatus,"#333")};'
+                f'font-weight:600;margin-top:6px">{ms}%</p>',
+                unsafe_allow_html=True
+            )
 
-def save_json(result: dict, path: str):
-    Path(path).write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(f"  JSON saved to: {path}")
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
+    # Three columns: critical | warnings | passed
+    col_c, col_w, col_p = st.columns(3)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 5.  CLI
-# ══════════════════════════════════════════════════════════════════════════════
+    with col_c:
+        st.markdown("#### 🔴 Critical gaps")
+        for item in result.get("critical", []):
+            with st.expander(f"**{item['title']}**"):
+                st.caption(f"Guideline: `{item.get('guideline','—')}`")
+                st.write(item.get("comment", ""))
 
-DEMO_CONTENT = """
-NDA submission for small molecule oral tablet (twice daily dosing).
+    with col_w:
+        st.markdown("#### 🟡 Warnings")
+        for item in result.get("warnings", []):
+            with st.expander(f"**{item['title']}**"):
+                st.caption(f"Guideline: `{item.get('guideline','—')}`")
+                st.write(item.get("comment", ""))
 
-Module 1: Cover letter present. Form FDA 356h complete. 
-No paediatric investigation plan submitted. Risk Management Plan (RMP) not included.
+    with col_p:
+        st.markdown("#### ✅ Passed checks")
+        for item in result.get("passed", []):
+            with st.expander(f"**{item['title']}**"):
+                st.write(item.get("comment", ""))
 
-Module 2: Quality Overall Summary (QOS) drafted but not finalised. 
-Non-clinical overview complete. Clinical overview complete.
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
-Module 3: Drug substance — synthesis route described, specifications set, 
-3 batches analytical data present. Stability data available for 12 months only 
-(accelerated and intermediate conditions). Container closure system described.
-Drug product — composition and formulation described, manufacturing process validated, 
-finished product specifications set, dissolution data complete.
-No comparability protocol for post-approval changes.
+    # Prioritised fix list
+    st.markdown("#### 🛠️ Prioritised fix list")
+    badge_map = {"P1": "badge-p1", "P2": "badge-p2", "P3": "badge-p3"}
+    label_map = {"P1": "P1 — Blocker", "P2": "P2 — Recommended", "P3": "P3 — Best practice"}
+    for i, fix in enumerate(result.get("fix_list", []), 1):
+        p = fix.get("priority", "P3")
+        badge_cls = badge_map.get(p, "badge-p3")
+        badge_lbl = label_map.get(p, p)
+        col_n, col_fix = st.columns([1, 10])
+        with col_n:
+            st.markdown(f"**{i}**")
+        with col_fix:
+            st.markdown(
+                f'<span class="{badge_cls}">{badge_lbl}</span> '
+                f'&nbsp; {fix["action"]} '
+                f'<span style="color:#999;font-size:0.8rem">[{fix.get("guideline","—")}]</span>',
+                unsafe_allow_html=True,
+            )
 
-Module 4: All non-clinical studies (pharmacology, PK, toxicology) complete and summarised.
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
-Module 5: Pivotal Phase 3 CSR complete. Phase 1/2 data complete. 
-No long-term safety update (120-day safety update outstanding).
-No dedicated hepatic impairment PK study.
-"""
+    # Raw JSON expander
+    with st.expander("🔍 View raw JSON response"):
+        st.json(result)
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Submission Readiness Scorecard Agent — NDA/MAA dossier reviewer",
-        formatter_class=argparse.RawTextHelpFormatter
+    st.success(
+        "✅ Scorecard complete. Take a screenshot and post it on LinkedIn! "
+        "Tag it #RegulatoryAI #Veeva #eCTD"
     )
-    parser.add_argument(
-        "--file", "-f",
-        type=str,
-        default=None,
-        help="Path to submission plan file (.pdf, .docx, .txt, .md)"
-    )
-    parser.add_argument(
-        "--region", "-r",
-        choices=["fda", "ema", "both"],
-        default="both",
-        help="Target region: fda | ema | both  (default: both)"
-    )
-    parser.add_argument(
-        "--product", "-p",
-        choices=["small_molecule", "biologic", "atmp"],
-        default="small_molecule",
-        help="Product type (default: small_molecule)"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        default=None,
-        help="Save plain-text report to this file path"
-    )
-    parser.add_argument(
-        "--json",
-        type=str,
-        default=None,
-        help="Save raw JSON result to this file path"
-    )
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Run with built-in demo dossier (no file needed)"
-    )
-
-    args = parser.parse_args()
-
-    # API key check
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[ERROR] ANTHROPIC_API_KEY environment variable not set.")
-        print("  Export it with: export ANTHROPIC_API_KEY=sk-ant-...")
-        sys.exit(1)
-
-    print("\n" + "=" * 70)
-    print("  SUBMISSION READINESS SCORECARD AGENT")
-    print("=" * 70)
-
-    # Load content
-    if args.demo:
-        print("  Mode     : Demo dossier")
-        content = DEMO_CONTENT.strip()
-    elif args.file:
-        print(f"  File     : {args.file}")
-        content = load_submission_file(args.file)
-    else:
-        # Interactive mode — prompt user
-        print("  No file specified. Options:")
-        print("    1. Enter a file path")
-        print("    2. Paste dossier text directly")
-        print("    3. Run demo")
-        choice = input("\n  Choice (1/2/3): ").strip()
-
-        if choice == "1":
-            file_path = input("  File path: ").strip()
-            content = load_submission_file(file_path)
-        elif choice == "2":
-            print("  Paste your dossier content below. Press Enter twice when done:")
-            lines = []
-            empty_count = 0
-            while empty_count < 2:
-                line = input()
-                if line == "":
-                    empty_count += 1
-                else:
-                    empty_count = 0
-                    lines.append(line)
-            content = "\n".join(lines)
-        else:
-            content = DEMO_CONTENT.strip()
-
-    print(f"  Region   : {args.region.upper()}")
-    print(f"  Product  : {args.product.replace('_', ' ').title()}")
-    print()
-
-    # Run agent
-    try:
-        result = run_scorecard(content, args.region, args.product)
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] Could not parse API response as JSON: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"[ERROR] API call failed: {e}")
-        sys.exit(1)
-
-    print()
-
-    # Render output
-    if RICH:
-        render_rich(result, args.output)
-    else:
-        render_plain(result, args.output)
-
-    # Save JSON if requested
-    if args.json:
-        save_json(result, args.json)
-
-    print()
-
-
-if __name__ == "__main__":
-    main()
