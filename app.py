@@ -1,5 +1,4 @@
 import streamlit as st
-import anthropic
 import json
 import re
 import pandas as pd
@@ -97,26 +96,340 @@ def find_column(df, keywords):
     """Find column by fuzzy matching keywords. Keywords is a list of possible names."""
     normalized_cols = {col: col.strip().replace('\n', ' ').replace('\r', ' ') for col in df.columns}
     normalized_cols = {' '.join(k.split()): v for k, v in normalized_cols.items()}
-    
+
     for keyword in keywords:
         keyword_normalized = ' '.join(keyword.strip().replace('\n', ' ').replace('\r', ' ').split())
         if keyword_normalized in normalized_cols:
             return normalized_cols[keyword_normalized]
-    
+
     # Fuzzy partial match
     for keyword in keywords:
         keyword_lower = keyword.lower()
         for normalized_col, original_col in normalized_cols.items():
             if keyword_lower in normalized_col.lower():
                 return original_col
-    
+
     return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# RULE-BASED REGULATORY ANALYSIS ENGINE (replaces Anthropic API)
+# ════════════════════════════════════════════════════════════════════════════
+def analyze_dossier(content: str, region: str, product_type: str) -> dict:
+    """
+    Local rule-based analysis of NDA/MAA dossier content.
+    Checks against ICH M4, Q1A, Q3D, M7, E11, FDA 21 CFR, EMA guidelines.
+    Returns a JSON-shaped dict identical to the previous LLM output.
+    """
+    text = content.lower()
+
+    def has_any(*keywords):
+        return any(k.lower() in text for k in keywords)
+
+    def mentions_missing(*keywords):
+        """Detect if content says something is missing/not included/outstanding."""
+        for k in keywords:
+            k_low = k.lower()
+            patterns = [
+                rf"no\s+{re.escape(k_low)}",
+                rf"not\s+(?:included|submitted|finalised|finalized|provided|available|complete)\b[^.]*\b{re.escape(k_low)}",
+                rf"{re.escape(k_low)}[^.]*\b(?:not|outstanding|missing|absent|pending|drafted but)",
+                rf"missing\s+{re.escape(k_low)}",
+                rf"without\s+{re.escape(k_low)}",
+            ]
+            for p in patterns:
+                if re.search(p, text):
+                    return True
+        return False
+
+    critical = []
+    warnings_list = []
+    passed = []
+    fix_list = []
+
+    # ── Module 1 – Administrative ───────────────────────────────────────────
+    m1_score = 100
+    if has_any("cover letter"):
+        passed.append({"title": "Cover letter present (Module 1)",
+                       "comment": "Administrative cover letter found in dossier."})
+    else:
+        warnings_list.append({"title": "Cover letter not confirmed",
+                              "guideline": "FDA 21 CFR 314.50 / EMA Notice to Applicants",
+                              "comment": "Ensure a cover letter is included in Module 1."})
+        m1_score -= 10
+
+    if has_any("356h", "form fda 356h"):
+        passed.append({"title": "Form FDA 356h completed",
+                       "comment": "Application form present for FDA submission."})
+    elif "FDA" in region:
+        critical.append({"title": "Form FDA 356h status unclear",
+                         "guideline": "FDA 21 CFR 314.50",
+                         "comment": "Form FDA 356h is required for any NDA submission."})
+        m1_score -= 20
+        fix_list.append({"priority": "P1",
+                         "action": "Complete and include Form FDA 356h",
+                         "guideline": "FDA 21 CFR 314.50"})
+
+    pip_missing = mentions_missing("paediatric investigation plan", "pip", "pediatric plan", "paediatric plan")
+    if pip_missing or "no paediatric" in text or "no pediatric" in text:
+        if "EMA" in region:
+            critical.append({"title": "No Paediatric Investigation Plan (PIP)",
+                             "guideline": "EU Regulation 1901/2006 / EMA PIP requirements",
+                             "comment": "An agreed PIP (or waiver/deferral) is mandatory for EMA MAA submissions."})
+            m1_score -= 25
+            fix_list.append({"priority": "P1",
+                             "action": "Submit agreed PIP, waiver, or deferral with PDCO",
+                             "guideline": "EU Regulation 1901/2006"})
+        if "FDA" in region:
+            critical.append({"title": "No Pediatric Study Plan (PSP)",
+                             "guideline": "FDA PREA / 21 USC 355c",
+                             "comment": "An initial Pediatric Study Plan is required under PREA for most NDAs."})
+            m1_score -= 20
+            fix_list.append({"priority": "P1",
+                             "action": "Submit initial Pediatric Study Plan (iPSP)",
+                             "guideline": "FDA PREA / 21 USC 355c"})
+
+    rmp_missing = mentions_missing("risk management plan", "rmp")
+    if rmp_missing:
+        if "EMA" in region:
+            critical.append({"title": "Risk Management Plan (RMP) not included",
+                             "guideline": "EMA GVP Module V (RMP)",
+                             "comment": "An EU-RMP is mandatory for all EMA MAA submissions."})
+            m1_score -= 20
+            fix_list.append({"priority": "P1",
+                             "action": "Prepare EU-RMP per GVP Module V template",
+                             "guideline": "EMA GVP Module V"})
+        else:
+            warnings_list.append({"title": "Risk Management Plan not included",
+                                  "guideline": "FDA REMS guidance / EMA GVP Module V",
+                                  "comment": "Consider whether REMS (FDA) or RMP is needed for this product."})
+            m1_score -= 10
+
+    # ── Module 2 – Summaries ────────────────────────────────────────────────
+    m2_score = 100
+    if has_any("quality overall summary", "qos"):
+        if "drafted but not final" in text or "not finalised" in text or "not finalized" in text:
+            warnings_list.append({"title": "Quality Overall Summary (QOS) not finalised",
+                                  "guideline": "ICH M4Q",
+                                  "comment": "Finalise the QOS before submission. A draft QOS is not acceptable."})
+            m2_score -= 15
+            fix_list.append({"priority": "P2",
+                             "action": "Finalise the Quality Overall Summary (QOS / Module 2.3)",
+                             "guideline": "ICH M4Q"})
+        else:
+            passed.append({"title": "Quality Overall Summary (QOS) present",
+                           "comment": "Module 2.3 drafted."})
+    else:
+        critical.append({"title": "Quality Overall Summary (QOS) status unclear",
+                         "guideline": "ICH M4Q (Module 2.3)",
+                         "comment": "QOS is a required CTD component."})
+        m2_score -= 20
+
+    if has_any("non-clinical overview", "nonclinical overview"):
+        passed.append({"title": "Non-clinical overview complete",
+                       "comment": "Module 2.4 present."})
+    if has_any("clinical overview"):
+        passed.append({"title": "Clinical overview complete",
+                       "comment": "Module 2.5 present."})
+
+    iss_missing = mentions_missing("integrated summary of safety", "iss") or "no integrated summary of safety" in text
+    ise_missing = mentions_missing("integrated summary of efficacy", "ise") or "no integrated summary of efficacy" in text
+    if iss_missing or ise_missing or "no integrated summary" in text:
+        if "FDA" in region:
+            critical.append({"title": "Integrated Summary of Safety/Efficacy (ISS/ISE) missing",
+                             "guideline": "FDA 21 CFR 314.50(d)(5)",
+                             "comment": "ISS and ISE are required for FDA NDA submissions."})
+            m2_score -= 25
+            fix_list.append({"priority": "P1",
+                             "action": "Prepare Integrated Summary of Safety (ISS) and Efficacy (ISE)",
+                             "guideline": "FDA 21 CFR 314.50(d)(5)"})
+
+    # ── Module 3 – CMC ──────────────────────────────────────────────────────
+    m3_score = 100
+    if has_any("synthesis route", "synthesis described"):
+        passed.append({"title": "Drug substance synthesis route described",
+                       "comment": "Module 3.2.S.2 present."})
+
+    # Stability check
+    stability_match = re.search(r"stability[^.]*?(\d+)\s*month", text)
+    if stability_match:
+        months = int(stability_match.group(1))
+        if months < 24:
+            critical.append({"title": f"Stability data only {months} months",
+                             "guideline": "ICH Q1A(R2)",
+                             "comment": f"NDA/MAA requires 24 months long-term stability at minimum. Current dossier shows only {months} months."})
+            m3_score -= 25
+            fix_list.append({"priority": "P1",
+                             "action": f"Generate at least {24-months} additional months of long-term stability data",
+                             "guideline": "ICH Q1A(R2)"})
+        else:
+            passed.append({"title": f"Stability data {months} months — meets ICH Q1A",
+                           "comment": "Long-term stability requirement met."})
+
+    # Genotoxic impurities (ICH M7)
+    if mentions_missing("genotoxic impurity assessment", "ich m7", "m7 assessment") or "no genotoxic" in text:
+        critical.append({"title": "No genotoxic (mutagenic) impurity assessment",
+                         "guideline": "ICH M7(R2)",
+                         "comment": "Mutagenic impurity assessment per ICH M7 is required for small molecules."})
+        m3_score -= 15
+        fix_list.append({"priority": "P1",
+                         "action": "Perform ICH M7 mutagenic impurity assessment ((Q)SAR + purge analysis)",
+                         "guideline": "ICH M7(R2)"})
+
+    # Elemental impurities (ICH Q3D)
+    if mentions_missing("elemental impurities", "q3d", "elemental impurity") or "no elemental impurities" in text:
+        critical.append({"title": "No elemental impurities assessment",
+                         "guideline": "ICH Q3D(R2)",
+                         "comment": "ICH Q3D risk assessment for elemental impurities is required for all NDAs/MAAs."})
+        m3_score -= 15
+        fix_list.append({"priority": "P1",
+                         "action": "Conduct ICH Q3D elemental impurities risk assessment",
+                         "guideline": "ICH Q3D(R2)"})
+
+    if has_any("container closure"):
+        passed.append({"title": "Container closure system described",
+                       "comment": "Module 3.2.P.7 present."})
+    if has_any("dissolution data"):
+        passed.append({"title": "Dissolution profile data complete",
+                       "comment": "Module 3.2.P.5 dissolution data included."})
+
+    if mentions_missing("comparability protocol") or "no comparability protocol" in text:
+        warnings_list.append({"title": "No comparability protocol for post-approval changes",
+                              "guideline": "ICH Q5E / FDA Guidance on Comparability Protocols",
+                              "comment": "Recommended to expedite future post-approval CMC changes."})
+        m3_score -= 5
+        fix_list.append({"priority": "P3",
+                         "action": "Consider including a comparability protocol for likely post-approval changes",
+                         "guideline": "ICH Q5E"})
+
+    # Biologic-specific
+    if "biologic" in product_type.lower() or "biosimilar" in product_type.lower():
+        if not has_any("comparability"):
+            warnings_list.append({"title": "Comparability data not confirmed (biologic)",
+                                  "guideline": "ICH Q5E",
+                                  "comment": "Biologics require comparability assessment between batches/process changes."})
+            m3_score -= 10
+
+    # ── Module 4 – Non-clinical ─────────────────────────────────────────────
+    m4_score = 100
+    if has_any("pharmacology", "toxicology") and ("complete" in text or "summarised" in text or "summarized" in text):
+        passed.append({"title": "Non-clinical pharmacology/PK/tox studies complete",
+                       "comment": "Module 4 study reports summarised."})
+    else:
+        warnings_list.append({"title": "Non-clinical study completeness unclear",
+                              "guideline": "ICH M3(R2)",
+                              "comment": "Confirm pharmacology, PK, and toxicology study reports are complete in Module 4."})
+        m4_score -= 15
+
+    if mentions_missing("juvenile animal study", "juvenile animal data") or "no juvenile animal" in text:
+        warnings_list.append({"title": "No juvenile animal study data",
+                              "guideline": "ICH S11 / EMA Guideline on Juvenile Animal Studies",
+                              "comment": "Required if paediatric use is intended and no equivalent clinical data exists."})
+        m4_score -= 10
+        fix_list.append({"priority": "P2",
+                         "action": "Provide juvenile animal study or scientific justification for waiver",
+                         "guideline": "ICH S11"})
+
+    # ── Module 5 – Clinical ─────────────────────────────────────────────────
+    m5_score = 100
+    if has_any("phase 3 csr", "pivotal phase 3", "phase iii csr"):
+        passed.append({"title": "Pivotal Phase 3 CSR complete",
+                       "comment": "Pivotal clinical study report present in Module 5."})
+    if has_any("phase 1", "phase 2") and "complete" in text:
+        passed.append({"title": "Phase 1/2 clinical data complete",
+                       "comment": "Earlier-phase studies summarised."})
+
+    if mentions_missing("120-day safety update", "120 day safety update") or "120-day safety update outstanding" in text:
+        if "FDA" in region:
+            critical.append({"title": "120-day safety update outstanding",
+                             "guideline": "FDA 21 CFR 314.50(d)(5)(vi)(b)",
+                             "comment": "Required for NDA submissions; must be submitted 120 days after initial submission."})
+            m5_score -= 15
+            fix_list.append({"priority": "P1",
+                             "action": "Prepare 120-day safety update for submission",
+                             "guideline": "FDA 21 CFR 314.50(d)(5)(vi)(b)"})
+
+    if mentions_missing("hepatic impairment", "hepatic impairment pk study") or "no dedicated hepatic impairment" in text:
+        warnings_list.append({"title": "No dedicated hepatic impairment PK study",
+                              "guideline": "FDA Guidance — PK in Patients with Impaired Hepatic Function / EMA CHMP/EWP/2339/02",
+                              "comment": "Recommended for small molecules cleared via hepatic metabolism."})
+        m5_score -= 10
+        fix_list.append({"priority": "P2",
+                         "action": "Conduct or justify waiver for hepatic impairment PK study",
+                         "guideline": "FDA/EMA hepatic impairment guidance"})
+
+    if mentions_missing("paediatric clinical data", "pediatric clinical data") or "no paediatric clinical" in text or "no pediatric clinical" in text:
+        warnings_list.append({"title": "No paediatric clinical data",
+                              "guideline": "ICH E11(R1)",
+                              "comment": "Address via PIP/PSP plan even if paediatric studies are deferred."})
+        m5_score -= 10
+
+    # ── Aggregate scoring ──────────────────────────────────────────────────
+    module_scores = [
+        ("Module 1 – Administrative", m1_score),
+        ("Module 2 – Summaries",      m2_score),
+        ("Module 3 – CMC",            m3_score),
+        ("Module 4 – Non-clinical",   m4_score),
+        ("Module 5 – Clinical",       m5_score),
+    ]
+
+    def status_for(s):
+        if s >= 80: return "green"
+        if s >= 60: return "amber"
+        return "red"
+
+    modules = [{"name": n, "score": max(0, s), "status": status_for(s)} for n, s in module_scores]
+    overall = round(sum(max(0, s) for _, s in module_scores) / len(module_scores))
+
+    if overall < 50:
+        readiness_label = "Not ready"
+        readiness_color = "red"
+    elif overall < 65:
+        readiness_label = "Needs significant work"
+        readiness_color = "orange"
+    elif overall < 80:
+        readiness_label = "Needs work"
+        readiness_color = "amber"
+    elif overall < 92:
+        readiness_label = "Nearly ready"
+        readiness_color = "amber"
+    else:
+        readiness_label = "Ready to file"
+        readiness_color = "green"
+
+    # If no specific passes detected, add a generic one to avoid an empty list
+    if not passed:
+        passed.append({"title": "Dossier content received",
+                       "comment": "Content provided for review."})
+
+    # Default fix items if list is short
+    if len(fix_list) < 3:
+        fix_list.append({"priority": "P3",
+                         "action": "Run a final eCTD validation (PDF specs, hyperlinks, granularity)",
+                         "guideline": "ICH M2 eCTD specification"})
+        fix_list.append({"priority": "P3",
+                         "action": "Cross-check Module 1 regional metadata for FDA/EMA",
+                         "guideline": "FDA eCTD Technical Conformance / EMA EU eCTD Module 1 spec"})
+
+    return {
+        "score": overall,
+        "passed_count": len(passed),
+        "critical_count": len(critical),
+        "warning_count": len(warnings_list),
+        "readiness_label": readiness_label,
+        "readiness_color": readiness_color,
+        "modules": modules,
+        "critical": critical,
+        "warnings": warnings_list,
+        "passed": passed,
+        "fix_list": fix_list,
+    }
+
 
 # ── Sidebar ───────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
-    api_key = st.text_input("Anthropic API Key", type="password",
-                            help="Get your key at console.anthropic.com")
+    st.success("✅ Running in offline mode — no API key required")
     st.markdown("---")
     region = st.selectbox("Target Region",
                           ["FDA + EMA (both)", "FDA only", "EMA only"])
@@ -204,84 +517,11 @@ with main_tab1:
     elif run_demo:
         content_to_run = DEMO_DOSSIER
 
-    # ── Run agent ─────────────────────────────────────────────────────────
+    # ── Run agent (local rule-based) ─────────────────────────────────────
     if content_to_run:
-        if not api_key:
-            st.error("Please enter your Anthropic API key in the sidebar.")
-            st.stop()
-
-        SYSTEM_PROMPT = """You are a senior regulatory affairs expert with 20+ years of experience 
-reviewing NDA and MAA submissions for FDA and EMA. You check dossiers against:
-- ICH M4 (CTD structure and completeness)
-- ICH Q1A (stability requirements)
-- ICH Q3D (elemental impurities)
-- ICH M7 (genotoxic impurities)
-- ICH E11 (paediatric studies)
-- FDA 21 CFR Part 314 (NDA requirements)
-- EMA Module 1 requirements and RMP guidelines
-
-You MUST respond ONLY with a valid JSON object. No markdown, no backticks, no preamble.
-The JSON must follow this exact schema:
-{
-  "score": <integer 0-100>,
-  "passed_count": <integer>,
-  "critical_count": <integer>,
-  "warning_count": <integer>,
-  "readiness_label": "<Not ready | Needs significant work | Needs work | Nearly ready | Ready to file>",
-  "readiness_color": "<red | orange | amber | green>",
-  "modules": [
-    {"name": "Module 1 – Administrative", "score": <0-100>, "status": "<green|amber|red>"},
-    {"name": "Module 2 – Summaries",      "score": <0-100>, "status": "<green|amber|red>"},
-    {"name": "Module 3 – CMC",            "score": <0-100>, "status": "<green|amber|red>"},
-    {"name": "Module 4 – Non-clinical",   "score": <0-100>, "status": "<green|amber|red>"},
-    {"name": "Module 5 – Clinical",       "score": <0-100>, "status": "<green|amber|red>"}
-  ],
-  "critical": [
-    {"title": "<issue>", "guideline": "<e.g. ICH Q1A(R2)>", "comment": "<specific regulatory comment>"}
-  ],
-  "warnings": [
-    {"title": "<issue>", "guideline": "<guideline ref>", "comment": "<comment>"}
-  ],
-  "passed": [
-    {"title": "<what passed>", "comment": "<brief note>"}
-  ],
-  "fix_list": [
-    {"priority": "P1", "action": "<specific action>", "guideline": "<ref>"},
-    {"priority": "P2", "action": "<specific action>", "guideline": "<ref>"},
-    {"priority": "P3", "action": "<specific action>", "guideline": "<ref>"}
-  ]
-}
-Include 3-7 critical issues, 2-5 warnings, 3-8 passed checks, 5-10 fix list items.
-Be specific. Reference real guidelines. P1 = submission blocker, P2 = strongly recommended, P3 = best practice."""
-
-        user_prompt = f"""Please evaluate this NDA/MAA submission for readiness.
-Target region: {region}
-Product type: {product_type}
-
-Dossier content:
-{content_to_run}
-
-Return the JSON scorecard."""
-
         with st.spinner("Analysing dossier against ICH guidelines and regional requirements..."):
             try:
-                client = anthropic.Anthropic(api_key=api_key)
-                response = client.messages.create(
-                    model="claude-sonnet-4-5",
-                    max_tokens=2000,
-                    system=SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": user_prompt}],
-                )
-                raw = response.content[0].text.strip()
-                raw = re.sub(r"```json|```", "", raw).strip()
-                result = json.loads(raw)
-            except json.JSONDecodeError:
-                st.error("Could not parse agent response. Try again.")
-                st.code(raw, language="text")
-                st.stop()
-            except anthropic.AuthenticationError:
-                st.error("Invalid API key. Check your key in the sidebar.")
-                st.stop()
+                result = analyze_dossier(content_to_run, region, product_type)
             except Exception as e:
                 st.error(f"Error: {e}")
                 st.stop()
@@ -590,13 +830,13 @@ with main_tab2:
 
             # Module-level summary
             st.markdown("#### 📋 Module-level completion")
-            
+
             for module_name in module_summary.index:
                 completion_pct = module_summary.loc[module_name, "Module Completion %"]
                 submitted = int(module_summary.loc[module_name, "Submitted Docs"])
                 total = int(module_summary.loc[module_name, "Total Docs"])
                 missing = int(module_summary.loc[module_name, "Missing Docs"])
-                
+
                 col_a, col_b, col_c = st.columns([2, 1, 2])
                 with col_a:
                     st.progress(
@@ -619,9 +859,9 @@ with main_tab2:
 
             # Document-level detail
             st.markdown("#### 📄 Document-level detail")
-            
+
             display_df = df[[
-                "Module Name", "Module Title", "Document ID", 
+                "Module Name", "Module Title", "Document ID",
                 "File Name of Document", "Planned Start Date", "Planned Finish Date",
                 "Status", "Completion %"
             ]].copy()
